@@ -25,7 +25,7 @@ class_names = [
     "Person",
     "Stairs",
     "Table",
-    "Trash"
+    "Trash",
     "Truck",
 ]
 
