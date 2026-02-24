@@ -1,7 +1,7 @@
 path: d:\Iris\models\dataset
 train: train/images
 val: val/images
-nc: 13
+nc: 12
 names:
   0: Bicycle
   1: Bus
@@ -9,10 +9,9 @@ names:
   3: Chair
   4: Cow
   5: Dogs
-  6: Horse
-  7: Motorcycle
-  8: Person
-  9: Stairs
-  10: Table
-  11: Trash
-  12: Truck
+  6: Motorcycle
+  7: Person
+  8: Stair
+  9: Table
+  10: Trash
+  11: Truck
