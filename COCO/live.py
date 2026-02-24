@@ -1,83 +1,193 @@
 import cv2
-import torch
 import numpy as np
-from ultralytics import YOLO
+import tensorflow as tf
+import os
 
-# Load YOLO model
-model = YOLO("yolov8n.pt")
+YOLO_PATH = r"d:\Iris\COCO\yolov8n.tflite"
+MIDAS_PATH = r"d:\Iris\COCO\midas_v21_small_256.tflite"
 
-# Load MiDaS model for depth estimation
-midas_model_type = "MiDaS_small" # Using small for faster live inference
-midas = torch.hub.load("intel-isl/MiDaS", midas_model_type)
-device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-midas.to(device)
-midas.eval()
+CLASSES = {
+  0: "person", 1: "bicycle", 2: "car", 3: "motorcycle", 4: "airplane", 5: "bus",
+  6: "train", 7: "truck", 8: "boat", 9: "traffic light", 10: "fire hydrant",
+  11: "stop sign", 12: "parking meter", 13: "bench", 14: "bird", 15: "cat",
+  16: "dog", 17: "horse", 18: "sheep", 19: "cow", 20: "elephant", 21: "bear",
+  22: "zebra", 23: "giraffe", 24: "backpack", 25: "umbrella", 26: "handbag",
+  27: "tie", 28: "suitcase", 29: "frisbee", 30: "skis", 31: "snowboard",
+  32: "sports ball", 33: "kite", 34: "baseball bat", 35: "baseball glove",
+  36: "skateboard", 37: "surfboard", 38: "tennis racket", 39: "bottle",
+  40: "wine glass", 41: "cup", 42: "fork", 43: "knife", 44: "spoon",
+  45: "bowl", 46: "banana", 47: "apple", 48: "sandwich", 49: "orange",
+  50: "broccoli", 51: "carrot", 52: "hot dog", 53: "pizza", 54: "donut",
+  55: "cake", 56: "chair", 57: "couch", 58: "potted plant", 59: "bed",
+  60: "dining table", 61: "toilet", 62: "tv", 63: "laptop", 64: "mouse",
+  65: "remote", 66: "keyboard", 67: "cell phone", 68: "microwave",
+  69: "oven", 70: "toaster", 71: "sink", 72: "refrigerator", 73: "book",
+  74: "clock", 75: "vase", 76: "scissors", 77: "teddy bear", 78: "hair drier",
+  79: "toothbrush"
+}
 
-# Load MiDaS transforms
-midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
-if midas_model_type == "DPT_Large" or midas_model_type == "DPT_Hybrid":
-    transform = midas_transforms.dpt_transform
-else:
-    transform = midas_transforms.small_transform
+def load_tflite_model(model_path):
+    interpreter = tf.lite.Interpreter(model_path=model_path)
+    interpreter.allocate_tensors()
+    return interpreter
 
-# Open webcam
-cap = cv2.VideoCapture(0)
+def main():
+    if not os.path.exists(YOLO_PATH) or not os.path.exists(MIDAS_PATH):
+        print(f"Error: Make sure both tflite models exist at {YOLO_PATH} and {MIDAS_PATH}")
+        return
 
-while cap.isOpened():
-    ret, frame = cap.read()
-    if not ret:
-        break
+    print("Loading models...")
+    yolo_interpreter = load_tflite_model(YOLO_PATH)
+    yolo_input_details = yolo_interpreter.get_input_details()
+    yolo_output_details = yolo_interpreter.get_output_details()
+    _, yolo_in_height, yolo_in_width, _ = yolo_input_details[0]['shape']
 
-    # YOLO object detection
-    results = model(frame)
+    midas_interpreter = load_tflite_model(MIDAS_PATH)
+    midas_input_details = midas_interpreter.get_input_details()
+    midas_output_details = midas_interpreter.get_output_details()
+    _, midas_in_height, midas_in_width, _ = midas_input_details[0]['shape']
+    print("Models loaded successfully.")
 
-    # MiDaS depth estimation
-    img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    input_batch = transform(img).to(device)
+    cap = cv2.VideoCapture(0)
+    print("Starting webcam... Press 'q' to quit.")
 
-    with torch.no_grad():
-        prediction = midas(input_batch)
-        prediction = torch.nn.functional.interpolate(
-            prediction.unsqueeze(1),
-            size=img.shape[:2],
-            mode="bicubic",
-            align_corners=False,
-        ).squeeze()
-    
-    depth_map = prediction.cpu().numpy()
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("Failed to grab frame from webcam")
+            break
 
-    # Process YOLO results and draw bounding boxes
-    for r in results:
-        boxes = r.boxes
+        orig_height, orig_width = frame.shape[:2]
+
+        # ==========================================
+        # 1. Run YOLO Object Detection
+        # ==========================================
+        # YOLOv8 typical input preprocessing
+        yolo_input_frame = cv2.resize(frame, (yolo_in_width, yolo_in_height))
+        yolo_input_frame = yolo_input_frame / 255.0
+        yolo_input_frame = yolo_input_frame.astype(np.float32)
+        yolo_input_frame = np.expand_dims(yolo_input_frame, axis=0)
+
+        yolo_interpreter.set_tensor(yolo_input_details[0]['index'], yolo_input_frame)
+        yolo_interpreter.invoke()
+        yolo_output = yolo_interpreter.get_tensor(yolo_output_details[0]['index'])
+        
+        # Parse YOLO output (handles [1, 84, 8400] or [1, 8400, 84] variants)
+        out = yolo_output[0]
+        if out.shape[0] == 84:
+            out = out.transpose(1, 0)
+            
+        boxes = out[:, :4]
+        scores = out[:, 4:]
+        class_ids = np.argmax(scores, axis=1)
+        confidences = np.max(scores, axis=1)
+        
+        # Filtering low confidence defaults
+        valid_indices = confidences > 0.4
+        boxes = boxes[valid_indices]
+        class_ids = class_ids[valid_indices]
+        confidences = confidences[valid_indices]
+        
+        # Check if boxes are normalized (between 0 and 1)
+        is_normalized = np.max(boxes) <= 2.0 if len(boxes) > 0 else False
+        
+        cv2_boxes = []
         for box in boxes:
-            x1, y1, x2, y2 = box.xyxy[0]
-            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-            conf = box.conf[0]
-            cls = int(box.cls[0])
-            name = model.names[cls]
-
-            # Calculate distance using depth map in the center of the bounding box
-            center_x, center_y = (x1 + x2) // 2, (y1 + y2) // 2
+            cx, cy, w, h = box
             
-            # Use depth map value. Note: MiDaS provides inverse depth, so higher value means closer.
-            # We can approximate relative distance as C / depth_value.
-            depth_value = depth_map[center_y, center_x]
-            distance = 1000.0 / depth_value if depth_value > 0 else 0
+            if is_normalized:
+                cx *= orig_width
+                cy *= orig_height
+                w *= orig_width
+                h *= orig_height
+            else:
+                # Rescale coordinate to original frame dimensions
+                cx *= (orig_width / yolo_in_width)
+                cy *= (orig_height / yolo_in_height)
+                w *= (orig_width / yolo_in_width)
+                h *= (orig_height / yolo_in_height)
             
-            # Draw bounding box
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            label = f"{name} {conf:.2f} Dist: {distance:.2f}"
+            x_min = int(cx - w / 2)
+            y_min = int(cy - h / 2)
+            cv2_boxes.append([x_min, y_min, int(w), int(h)])
             
-            # Draw the label with a background for better visibility
-            (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-            cv2.rectangle(frame, (x1, y1 - 20), (x1 + w, y1), (0, 255, 0), -1)
-            cv2.putText(frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+        # NMS to remove overlapping boxes
+        indices = cv2.dnn.NMSBoxes(cv2_boxes, confidences.tolist(), 0.4, 0.4)
 
-    # Show the result
-    cv2.imshow("Live Detection & Distance", frame)
+        # ==========================================
+        # 2. Run MiDaS Depth Estimation
+        # ==========================================
+        # MiDaS typical input preprocessing
+        midas_input_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        midas_input_frame = cv2.resize(midas_input_frame, (midas_in_width, midas_in_height))
+        midas_input_frame = midas_input_frame.astype(np.float32) / 255.0
 
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+        midas_mean = [0.485, 0.456, 0.406]
+        midas_std = [0.229, 0.224, 0.225]
+        midas_input_frame = (midas_input_frame - midas_mean) / midas_std
+        midas_input_frame = np.expand_dims(midas_input_frame, axis=0).astype(np.float32)
 
-cap.release()
-cv2.destroyAllWindows()
+        midas_interpreter.set_tensor(midas_input_details[0]['index'], midas_input_frame)
+        midas_interpreter.invoke()
+        midas_output = midas_interpreter.get_tensor(midas_output_details[0]['index'])
+
+        depth_map = midas_output[0]
+        if depth_map.ndim == 3: # In some outputs, depth has shape (H, W, 1)
+            depth_map = np.squeeze(depth_map)
+        depth_map = cv2.resize(depth_map, (orig_width, orig_height))
+        
+        # Normalize depth map for display
+        depth_min = depth_map.min()
+        depth_max = depth_map.max()
+        if depth_max - depth_min > 0:
+            depth_norm = (depth_map - depth_min) / (depth_max - depth_min)
+        else:
+            depth_norm = depth_map
+        depth_uint8 = (depth_norm * 255).astype(np.uint8)
+        depth_colormap = cv2.applyColorMap(depth_uint8, cv2.COLORMAP_INFERNO)
+        
+        combined_frame = frame.copy()
+
+        # ==========================================
+        # 3. Visualization and Result Merging
+        # ==========================================
+        if len(indices) > 0:
+            for i in indices.flatten():
+                x, y, w, h = cv2_boxes[i]
+                conf = confidences[i]
+                class_id = class_ids[i]
+                label = CLASSES.get(class_id, "Unknown")
+                
+                # Estimate depth at center of bounding box
+                cx = int(x + w/2)
+                cy = int(y + h/2)
+                cx = max(0, min(cx, orig_width - 1))
+                cy = max(0, min(cy, orig_height - 1))
+                rel_depth_val = depth_uint8[cy, cx]
+                
+                text = f"{label} {conf:.2f} (Rel Dist: {rel_depth_val})"
+                
+                # Plot box and text on the raw color frame
+                cv2.rectangle(combined_frame, (x, y), (x + w, y + h), (0, 255, 0), 3)
+                cv2.putText(combined_frame, text, (max(0, x), max(10, y - 5)), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                            
+                # Also plot box and text on the colorized depth map
+                cv2.rectangle(depth_colormap, (x, y), (x + w, y + h), (255, 255, 255), 3)
+                cv2.putText(depth_colormap, text, (max(0, x), max(10, y - 5)), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)                
+                
+                print(f"Object: {label}, Confidence: {conf:.2f}, Box: [{x},{y},{w},{h}], Rel Dist: {rel_depth_val}")
+
+        # Horizontally stack frame and depth map for a unified screen
+        stacked_screen = np.hstack((combined_frame, depth_colormap))
+        cv2.imshow("Detection and Depth Map Screens", stacked_screen)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == '__main__':
+    main()
