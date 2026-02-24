@@ -27,6 +27,7 @@ class _DetectionScreenState extends State<DetectionScreen>
   bool _isDetecting = false;
   bool _isCameraReady = false;
   bool _isProcessing = false;
+  bool _midasEnabled = true;
   String _statusMessage = 'Initializing...';
   int _frameCount = 0;
 
@@ -372,6 +373,44 @@ class _DetectionScreenState extends State<DetectionScreen>
                       ),
                     ),
                   ),
+                const SizedBox(width: 8),
+                // MiDaS toggle button
+                Semantics(
+                  label: _midasEnabled
+                      ? 'Depth estimation on. Double tap to turn off.'
+                      : 'Depth estimation off. Double tap to turn on.',
+                  button: true,
+                  child: GestureDetector(
+                    onTap: () {
+                      setState(() {
+                        _midasEnabled = !_midasEnabled;
+                        _tfliteService.midasEnabled = _midasEnabled;
+                      });
+                    },
+                    child: AnimatedContainer(
+                      duration: const Duration(milliseconds: 250),
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        color: _midasEnabled
+                            ? const Color(0xFF6C63FF).withOpacity(0.3)
+                            : Colors.white.withOpacity(0.08),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: _midasEnabled
+                              ? const Color(0xFF6C63FF).withOpacity(0.6)
+                              : Colors.white.withOpacity(0.15),
+                        ),
+                      ),
+                      child: Icon(
+                        Icons.layers_rounded,
+                        color: _midasEnabled
+                            ? const Color(0xFF6C63FF)
+                            : Colors.white38,
+                        size: 20,
+                      ),
+                    ),
+                  ),
+                ),
               ],
             ),
           ),

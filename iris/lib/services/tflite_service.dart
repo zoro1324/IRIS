@@ -15,6 +15,9 @@ class TfliteService {
   Interpreter? _midasInterpreter;
   bool _isInitialized = false;
 
+  /// Whether MiDaS depth estimation is enabled
+  bool midasEnabled = true;
+
   /// YOLO model class names matching data.yaml
   static const List<String> classNames = [
     'Bicycle',
@@ -52,17 +55,29 @@ class TfliteService {
     try {
       // Load YOLO model
       _yoloInterpreter = await Interpreter.fromAsset(
-        'best-obj.tflite',
+        'assets/best-obj.tflite',
         options: InterpreterOptions()..threads = 4,
       );
       print('YOLO TFLite model loaded successfully');
+      // Print YOLO model tensor info
+      final yoloInput = _yoloInterpreter!.getInputTensor(0);
+      final yoloOutput = _yoloInterpreter!.getOutputTensor(0);
+      print('YOLO input shape: ${yoloInput.shape}, type: ${yoloInput.type}');
+      print('YOLO output shape: ${yoloOutput.shape}, type: ${yoloOutput.type}');
 
       // Load MiDaS model
       _midasInterpreter = await Interpreter.fromAsset(
-        'midas_v21_small_256.tflite',
+        'assets/midas_v21_small_256.tflite',
         options: InterpreterOptions()..threads = 2,
       );
       print('MiDaS TFLite model loaded successfully');
+      // Print MiDaS model tensor info
+      final midasInput = _midasInterpreter!.getInputTensor(0);
+      final midasOutput = _midasInterpreter!.getOutputTensor(0);
+      print('MiDaS input shape: ${midasInput.shape}, type: ${midasInput.type}');
+      print(
+        'MiDaS output shape: ${midasOutput.shape}, type: ${midasOutput.type}',
+      );
 
       _isInitialized = true;
     } catch (e) {
@@ -72,47 +87,74 @@ class TfliteService {
   }
 
   /// Run detection on a camera image
+  int _debugFrameCounter = 0;
+
   Future<List<DetectionResult>> detectObjects(
     CameraImage cameraImage,
     int imageWidth,
     int imageHeight,
   ) async {
-    if (!_isInitialized) return [];
+    if (!_isInitialized) {
+      print('DEBUG: detectObjects called but not initialized!');
+      return [];
+    }
+    _debugFrameCounter++;
+    final bool shouldLog = _debugFrameCounter % 30 == 1; // Log every 30th call
+    if (shouldLog) {
+      print(
+        'DEBUG: Processing frame #$_debugFrameCounter (${imageWidth}x$imageHeight)',
+      );
+    }
 
     try {
       // Convert CameraImage to RGB bytes
       final rgbBytes = _convertCameraImage(cameraImage);
-      if (rgbBytes == null) return [];
+      if (rgbBytes == null) {
+        if (shouldLog) print('DEBUG: Image conversion returned null!');
+        return [];
+      }
+      if (shouldLog) {
+        print('DEBUG: Image converted, bytes length: ${rgbBytes.length}');
+      }
 
       // Run YOLO detection
       final detections = _runYoloInference(rgbBytes, imageWidth, imageHeight);
+      if (shouldLog) {
+        print('DEBUG: YOLO returned ${detections.length} raw detections');
+      }
 
-      // Run MiDaS depth estimation
-      final depthMap = _runMidasInference(rgbBytes, imageWidth, imageHeight);
+      // Run MiDaS depth estimation only if enabled
+      final Float32List? depthMap = midasEnabled
+          ? _runMidasInference(rgbBytes, imageWidth, imageHeight)
+          : null;
 
       // Combine detections with depth
       final results = <DetectionResult>[];
       for (final det in detections) {
-        final centerX = ((det['x1'] + det['x2']) / 2)
-            .clamp(0, imageWidth - 1)
-            .toInt();
-        final centerY = ((det['y1'] + det['y2']) / 2)
-            .clamp(0, imageHeight - 1)
-            .toInt();
+        double distance = 999.0;
 
-        // Sample depth at center of bounding box
-        final depthX = (centerX * midasInputSize / imageWidth).toInt().clamp(
-          0,
-          midasInputSize - 1,
-        );
-        final depthY = (centerY * midasInputSize / imageHeight).toInt().clamp(
-          0,
-          midasInputSize - 1,
-        );
-        final depthValue = depthMap[depthY * midasInputSize + depthX];
+        if (depthMap != null) {
+          final centerX = ((det['x1'] + det['x2']) / 2)
+              .clamp(0, imageWidth - 1)
+              .toInt();
+          final centerY = ((det['y1'] + det['y2']) / 2)
+              .clamp(0, imageHeight - 1)
+              .toInt();
 
-        // Convert inverse depth to approximate distance
-        final distance = depthValue > 0 ? 1000.0 / depthValue : 999.0;
+          // Sample depth at center of bounding box
+          final depthX = (centerX * midasInputSize / imageWidth).toInt().clamp(
+            0,
+            midasInputSize - 1,
+          );
+          final depthY = (centerY * midasInputSize / imageHeight).toInt().clamp(
+            0,
+            midasInputSize - 1,
+          );
+          final depthValue = depthMap[depthY * midasInputSize + depthX];
+
+          // Convert inverse depth to approximate distance
+          distance = depthValue > 0 ? 1000.0 / depthValue : 999.0;
+        }
 
         results.add(
           DetectionResult(
@@ -132,6 +174,14 @@ class TfliteService {
 
       // Sort by priority (closest first)
       results.sort((a, b) => a.priority.compareTo(b.priority));
+      if (shouldLog) print('DEBUG: Final results count: ${results.length}');
+      if (shouldLog && results.isNotEmpty) {
+        for (final r in results) {
+          print(
+            'DEBUG:   ${r.className} conf=${r.confidence.toStringAsFixed(3)} dist=${r.depthValue.toStringAsFixed(1)}',
+          );
+        }
+      }
       return results;
     } catch (e) {
       print('Detection error: $e');
@@ -225,19 +275,41 @@ class TfliteService {
 
     // Get output shape and allocate output
     final outputShape = _yoloInterpreter!.getOutputTensor(0).shape;
-    // YOLO output is typically [1, num_boxes, 4+num_classes] or [1, 4+num_classes, num_boxes]
-    final outputSize = outputShape.reduce((a, b) => a * b);
-    final outputFlat = Float32List(outputSize);
+    // YOLO output: [1, 16, 8400] means transposed format: [1, 4+num_classes, num_detections]
+    print('DEBUG YOLO: inputShape=$inputShape, outputShape=$outputShape');
+
+    // Allocate output as nested List to match tflite_flutter expectations
+    // For shape [1, 16, 8400], create List<List<List<double>>>
+    final output = List.generate(
+      outputShape[0],
+      (_) => List.generate(
+        outputShape[1],
+        (_) => List.filled(outputShape[2], 0.0),
+      ),
+    );
 
     // Run inference
-    final outputMap = <int, Object>{};
-    if (outputShape.length == 3) {
-      final output = outputFlat.reshape(outputShape);
-      outputMap[0] = output;
-    } else {
-      outputMap[0] = outputFlat;
+    _yoloInterpreter!.run(inputTensor, output);
+
+    // Flatten the nested output to Float32List for parsing
+    final outputSize = outputShape.reduce((a, b) => a * b);
+    final outputFlat = Float32List(outputSize);
+    int idx = 0;
+    for (int i = 0; i < outputShape[1]; i++) {
+      for (int j = 0; j < outputShape[2]; j++) {
+        outputFlat[idx++] = output[0][i][j].toDouble();
+      }
     }
-    _yoloInterpreter!.runForMultipleInputs([inputTensor], outputMap);
+
+    // Debug: check output statistics
+    double maxVal = -1e9, minVal = 1e9;
+    for (int i = 0; i < outputFlat.length; i++) {
+      if (outputFlat[i] > maxVal) maxVal = outputFlat[i];
+      if (outputFlat[i] < minVal) minVal = outputFlat[i];
+    }
+    print(
+      'DEBUG YOLO: output stats min=$minVal max=$maxVal, totalElements=${outputFlat.length}',
+    );
 
     // Parse YOLO output
     return _parseYoloOutput(
@@ -323,6 +395,9 @@ class TfliteService {
       }
 
       if (maxScore < confidenceThreshold) continue;
+      print(
+        'DEBUG YOLO: Detection found! class=$maxIdx (${maxIdx < classNames.length ? classNames[maxIdx] : "?"}) score=$maxScore cx=$cx cy=$cy w=$w h=$h',
+      );
 
       // Convert from center format to corner format, scale to image size
       final scaleX = imageWidth / inputW;
@@ -396,8 +471,9 @@ class TfliteService {
     int imageWidth,
     int imageHeight,
   ) {
-    if (_midasInterpreter == null)
+    if (_midasInterpreter == null) {
       return Float32List(midasInputSize * midasInputSize);
+    }
 
     // Preprocess: resize + normalize with MiDaS-specific values
     final input = Float32List(1 * midasInputSize * midasInputSize * 3);
