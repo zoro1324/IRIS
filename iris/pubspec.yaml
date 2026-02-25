@@ -26,5 +26,5 @@ dev_dependencies:
 flutter:
   uses-material-design: true
   assets:
-    - assets/best-obj.tflite
+    - assets/yolov8n.tflite
     - assets/midas_v21_small_256.tflite

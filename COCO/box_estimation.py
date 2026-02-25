@@ -4,7 +4,6 @@ import tensorflow as tf
 import os
 
 YOLO_PATH = r"d:\Iris\COCO\yolov8n.tflite"
-MIDAS_PATH = r"d:\Iris\COCO\midas_v21_small_256.tflite"
 
 CLASSES = {
   0: "person", 1: "bicycle", 2: "car", 3: "motorcycle", 4: "airplane", 5: "bus",
@@ -26,27 +25,52 @@ CLASSES = {
   79: "toothbrush"
 }
 
+# Known average heights in centimeters (cm) for various objects
+# You can tweak these based on what you want to detect
+KNOWN_HEIGHTS = {
+    "person": 170.0,
+    "bicycle": 105.0,
+    "car": 150.0,
+    "motorcycle": 120.0,
+    "bus": 300.0,
+    "truck": 300.0,
+    "cat": 30.0,
+    "dog": 50.0,
+    "bottle": 25.0,
+    "cup": 10.0,
+    "chair": 100.0,
+    "laptop": 25.0,
+    "cell phone": 15.0,
+    "book": 20.0
+}
+DEFAULT_HEIGHT = 50.0 # Default fallback height
+
+# Assumed focal length of the camera in pixels (You might need to calibrate this for your specific webcam)
+# A typical value for 720p/1080p webcams is around 600 - 800
+FOCAL_LENGTH = 700.0 
+
+def estimate_distance(known_height, apparent_height_pixels):
+    if apparent_height_pixels <= 0:
+        return 0
+    # Distance = (Known Height * Focal Length) / Apparent Height in pixels
+    return (known_height * FOCAL_LENGTH) / apparent_height_pixels
+
 def load_tflite_model(model_path):
     interpreter = tf.lite.Interpreter(model_path=model_path)
     interpreter.allocate_tensors()
     return interpreter
 
 def main():
-    if not os.path.exists(YOLO_PATH) or not os.path.exists(MIDAS_PATH):
-        print(f"Error: Make sure both tflite models exist at {YOLO_PATH} and {MIDAS_PATH}")
+    if not os.path.exists(YOLO_PATH):
+        print(f"Error: Make sure the tflite model exists at {YOLO_PATH}")
         return
 
-    print("Loading models...")
+    print("Loading YOLO model...")
     yolo_interpreter = load_tflite_model(YOLO_PATH)
     yolo_input_details = yolo_interpreter.get_input_details()
     yolo_output_details = yolo_interpreter.get_output_details()
     _, yolo_in_height, yolo_in_width, _ = yolo_input_details[0]['shape']
-
-    midas_interpreter = load_tflite_model(MIDAS_PATH)
-    midas_input_details = midas_interpreter.get_input_details()
-    midas_output_details = midas_interpreter.get_output_details()
-    _, midas_in_height, midas_in_width, _ = midas_input_details[0]['shape']
-    print("Models loaded successfully.")
+    print("Model loaded successfully.")
 
     cap = cv2.VideoCapture(0)
     print("Starting webcam... Press 'q' to quit.")
@@ -59,10 +83,7 @@ def main():
 
         orig_height, orig_width = frame.shape[:2]
 
-        # ==========================================
-        # 1. Run YOLO Object Detection
-        # ==========================================
-        # YOLOv8 typical input preprocessing
+        # YOLOv8 preprocessing
         yolo_input_frame = cv2.resize(frame, (yolo_in_width, yolo_in_height))
         yolo_input_frame = yolo_input_frame / 255.0
         yolo_input_frame = yolo_input_frame.astype(np.float32)
@@ -72,7 +93,7 @@ def main():
         yolo_interpreter.invoke()
         yolo_output = yolo_interpreter.get_tensor(yolo_output_details[0]['index'])
         
-        # Parse YOLO output (handles [1, 84, 8400] or [1, 8400, 84] variants)
+        # Parse YOLO output
         out = yolo_output[0]
         if out.shape[0] == 84:
             out = out.transpose(1, 0)
@@ -82,18 +103,17 @@ def main():
         class_ids = np.argmax(scores, axis=1)
         confidences = np.max(scores, axis=1)
         
-        # Filtering low confidence defaults
-        score_threshold = 0.25
+        # Filter low confidence
+        score_threshold = 0.4
         valid_indices = confidences > score_threshold
         boxes = boxes[valid_indices]
         class_ids = class_ids[valid_indices]
         confidences = confidences[valid_indices]
         
-        # Check if boxes are normalized (between 0 and 1)
         is_normalized = np.max(boxes) <= 2.0 if len(boxes) > 0 else False
         
         cv2_boxes = []
-        for box in boxes:
+        for box, class_id in zip(boxes, class_ids):
             cx, cy, w, h = box
             
             if is_normalized:
@@ -102,7 +122,6 @@ def main():
                 w *= orig_width
                 h *= orig_height
             else:
-                # Rescale coordinate to original frame dimensions
                 cx *= (orig_width / yolo_in_width)
                 cy *= (orig_height / yolo_in_height)
                 w *= (orig_width / yolo_in_width)
@@ -110,54 +129,16 @@ def main():
             
             x_min = int(cx - w / 2)
             y_min = int(cy - h / 2)
+            
             cv2_boxes.append([x_min, y_min, int(w), int(h)])
             
-        # Class-aware NMS to avoid different classes suppressing each other
-        max_wh = 7680  # large offset
         nms_boxes = []
+        max_wh = 7680 # Avoid NMS cross-class suppression
         for j, b in enumerate(cv2_boxes):
             nms_boxes.append([b[0] + class_ids[j] * max_wh, b[1] + class_ids[j] * max_wh, b[2], b[3]])
 
-        # NMS to remove overlapping boxes
         indices = cv2.dnn.NMSBoxes(nms_boxes, confidences.tolist(), score_threshold, 0.45)
 
-        # ==========================================
-        # 2. Run MiDaS Depth Estimation
-        # ==========================================
-        # MiDaS typical input preprocessing
-        midas_input_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        midas_input_frame = cv2.resize(midas_input_frame, (midas_in_width, midas_in_height))
-        midas_input_frame = midas_input_frame.astype(np.float32) / 255.0
-
-        midas_mean = [0.485, 0.456, 0.406]
-        midas_std = [0.229, 0.224, 0.225]
-        midas_input_frame = (midas_input_frame - midas_mean) / midas_std
-        midas_input_frame = np.expand_dims(midas_input_frame, axis=0).astype(np.float32)
-
-        midas_interpreter.set_tensor(midas_input_details[0]['index'], midas_input_frame)
-        midas_interpreter.invoke()
-        midas_output = midas_interpreter.get_tensor(midas_output_details[0]['index'])
-
-        depth_map = midas_output[0]
-        if depth_map.ndim == 3: # In some outputs, depth has shape (H, W, 1)
-            depth_map = np.squeeze(depth_map)
-        depth_map = cv2.resize(depth_map, (orig_width, orig_height))
-        
-        # Normalize depth map for display
-        depth_min = depth_map.min()
-        depth_max = depth_map.max()
-        if depth_max - depth_min > 0:
-            depth_norm = (depth_map - depth_min) / (depth_max - depth_min)
-        else:
-            depth_norm = depth_map
-        depth_uint8 = (depth_norm * 255).astype(np.uint8)
-        depth_colormap = cv2.applyColorMap(depth_uint8, cv2.COLORMAP_INFERNO)
-        
-        combined_frame = frame.copy()
-
-        # ==========================================
-        # 3. Visualization and Result Merging
-        # ==========================================
         if len(indices) > 0:
             for i in indices.flatten():
                 x, y, w, h = cv2_boxes[i]
@@ -165,30 +146,24 @@ def main():
                 class_id = class_ids[i]
                 label = CLASSES.get(class_id, "Unknown")
                 
-                # Estimate depth at center of bounding box
-                cx = int(x + w/2)
-                cy = int(y + h/2)
-                cx = max(0, min(cx, orig_width - 1))
-                cy = max(0, min(cy, orig_height - 1))
-                rel_depth_val = depth_uint8[cy, cx]
-                
-                text = f"{label} {conf:.2f} (Rel Dist: {rel_depth_val})"
-                
-                # Plot box and text on the raw color frame
-                cv2.rectangle(combined_frame, (x, y), (x + w, y + h), (0, 255, 0), 3)
-                cv2.putText(combined_frame, text, (max(0, x), max(10, y - 5)), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                            
-                # Also plot box and text on the colorized depth map
-                cv2.rectangle(depth_colormap, (x, y), (x + w, y + h), (255, 255, 255), 3)
-                cv2.putText(depth_colormap, text, (max(0, x), max(10, y - 5)), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)                
-                
-                print(f"Object: {label}, Confidence: {conf:.2f}, Box: [{x},{y},{w},{h}], Rel Dist: {rel_depth_val}")
+                # Estimate distance using bounding box height
+                known_h = KNOWN_HEIGHTS.get(label, DEFAULT_HEIGHT)
+                distance_cm = estimate_distance(known_h, h)
+                distance_m = distance_cm / 100.0
 
-        # Horizontally stack frame and depth map for a unified screen
-        stacked_screen = np.hstack((combined_frame, depth_colormap))
-        cv2.imshow("Detection and Depth Map Screens", stacked_screen)
+                text = f"{label} {conf:.2f} | Dist: {distance_m:.2f}m"
+                
+                # Draw box and label
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                
+                # Background for text
+                (text_width, text_height), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                cv2.rectangle(frame, (x, y - text_height - baseline - 5), (x + text_width, y), (0, 255, 0), -1)
+                
+                cv2.putText(frame, text, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+                print(f"Detected: {label}, Conf: {conf:.2f}, Box: [{x},{y},{w},{h}], Est. Dist: {distance_m:.2f}m")
+
+        cv2.imshow("YOLO Box Distance Estimation", frame)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
@@ -196,5 +171,5 @@ def main():
     cap.release()
     cv2.destroyAllWindows()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

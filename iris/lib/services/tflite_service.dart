@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:typed_data';
 import 'dart:math';
 import 'package:camera/camera.dart';
@@ -5,7 +6,23 @@ import 'package:tflite_flutter/tflite_flutter.dart';
 import '../models/detection_result.dart';
 import 'dart:ui';
 
-/// Service for running TFLite inference (YOLO + MiDaS)
+/// Plane data copied out of a CameraImage before any async work.
+class CameraPlane {
+  final Uint8List bytes;
+  final int bytesPerRow;
+  const CameraPlane({required this.bytes, required this.bytesPerRow});
+}
+
+/// Service for running TFLite inference (YOLO + MiDaS).
+///
+/// Architecture (Mali-GPU-safe):
+///  • Plain [Interpreter] on the main isolate — no IsolateInterpreter
+///    (which crashes Mali GPUs by sharing native memory across isolates).
+///  • The detection_screen STOPS the camera image stream before calling
+///    detectObjects(), and RESTARTS it after. This ensures:
+///      1. No camera buffer contention during inference
+///      2. The GPU isn't rendering camera frames while TFLite runs
+///  • Frame rate is throttled via a Timer rather than frame counting.
 class TfliteService {
   static final TfliteService _instance = TfliteService._internal();
   factory TfliteService() => _instance;
@@ -14,148 +31,174 @@ class TfliteService {
   Interpreter? _yoloInterpreter;
   Interpreter? _midasInterpreter;
   bool _isInitialized = false;
-
-  /// Whether MiDaS depth estimation is enabled
   bool midasEnabled = true;
 
-  /// YOLO model class names matching data.yaml
+  /// COCO 80-class names
   static const List<String> classNames = [
-    'Bicycle',
-    'Bus',
-    'Car',
-    'Chair',
-    'Cow',
-    'Dogs',
-    'Motorcycle',
-    'Person',
-    'Stair',
-    'Table',
-    'Trash',
-    'Truck',
+    'person',
+    'bicycle',
+    'car',
+    'motorcycle',
+    'airplane',
+    'bus',
+    'train',
+    'truck',
+    'boat',
+    'traffic light',
+    'fire hydrant',
+    'stop sign',
+    'parking meter',
+    'bench',
+    'bird',
+    'cat',
+    'dog',
+    'horse',
+    'sheep',
+    'cow',
+    'elephant',
+    'bear',
+    'zebra',
+    'giraffe',
+    'backpack',
+    'umbrella',
+    'handbag',
+    'tie',
+    'suitcase',
+    'frisbee',
+    'skis',
+    'snowboard',
+    'sports ball',
+    'kite',
+    'baseball bat',
+    'baseball glove',
+    'skateboard',
+    'surfboard',
+    'tennis racket',
+    'bottle',
+    'wine glass',
+    'cup',
+    'fork',
+    'knife',
+    'spoon',
+    'bowl',
+    'banana',
+    'apple',
+    'sandwich',
+    'orange',
+    'broccoli',
+    'carrot',
+    'hot dog',
+    'pizza',
+    'donut',
+    'cake',
+    'chair',
+    'couch',
+    'potted plant',
+    'bed',
+    'dining table',
+    'toilet',
+    'tv',
+    'laptop',
+    'mouse',
+    'remote',
+    'keyboard',
+    'cell phone',
+    'microwave',
+    'oven',
+    'toaster',
+    'sink',
+    'refrigerator',
+    'book',
+    'clock',
+    'vase',
+    'scissors',
+    'teddy bear',
+    'hair drier',
+    'toothbrush',
   ];
 
-  /// YOLO input size (typical for YOLO TFLite)
-  static const int yoloInputSize = 320;
-
-  /// MiDaS input size
   static const int midasInputSize = 256;
-
-  /// Confidence threshold
-  static const double confidenceThreshold = 0.4;
-
-  /// NMS IoU threshold
-  static const double iouThreshold = 0.45;
+  static const double _confidenceThreshold = 0.4;
+  static const double _iouThreshold = 0.45;
 
   bool get isInitialized => _isInitialized;
 
-  /// Initialize both models
+  // ─── Initialization ──────────────────────────────────────────────────────────
+
   Future<void> initialize() async {
     if (_isInitialized) return;
-
     try {
-      // Load YOLO model
       _yoloInterpreter = await Interpreter.fromAsset(
-        'assets/best-obj.tflite',
+        'assets/yolov8n.tflite',
         options: InterpreterOptions()..threads = 4,
       );
-      print('YOLO TFLite model loaded successfully');
-      // Print YOLO model tensor info
-      final yoloInput = _yoloInterpreter!.getInputTensor(0);
-      final yoloOutput = _yoloInterpreter!.getOutputTensor(0);
-      print('YOLO input shape: ${yoloInput.shape}, type: ${yoloInput.type}');
-      print('YOLO output shape: ${yoloOutput.shape}, type: ${yoloOutput.type}');
+      print('YOLO loaded');
+      print('  input : ${_yoloInterpreter!.getInputTensor(0).shape}');
+      print('  output: ${_yoloInterpreter!.getOutputTensor(0).shape}');
 
-      // Load MiDaS model
       _midasInterpreter = await Interpreter.fromAsset(
         'assets/midas_v21_small_256.tflite',
         options: InterpreterOptions()..threads = 2,
       );
-      print('MiDaS TFLite model loaded successfully');
-      // Print MiDaS model tensor info
-      final midasInput = _midasInterpreter!.getInputTensor(0);
-      final midasOutput = _midasInterpreter!.getOutputTensor(0);
-      print('MiDaS input shape: ${midasInput.shape}, type: ${midasInput.type}');
-      print(
-        'MiDaS output shape: ${midasOutput.shape}, type: ${midasOutput.type}',
-      );
-
+      print('MiDaS loaded');
       _isInitialized = true;
     } catch (e) {
-      print('Error loading TFLite models: $e');
+      print('Error loading models: $e');
       rethrow;
     }
   }
 
-  /// Run detection on a camera image
-  int _debugFrameCounter = 0;
+  // ─── Public API ──────────────────────────────────────────────────────────────
 
+  /// Run detection on pre-copied plane data.
+  ///
+  /// IMPORTANT: The caller (detection_screen) must STOP the camera image
+  /// stream BEFORE calling this, and RESTART it AFTER this returns. This
+  /// prevents Mali GPU contention between the camera HAL and TFLite.
   Future<List<DetectionResult>> detectObjects(
-    CameraImage cameraImage,
     int imageWidth,
     int imageHeight,
+    ImageFormatGroup format,
+    List<CameraPlane> planes,
   ) async {
-    if (!_isInitialized) {
-      print('DEBUG: detectObjects called but not initialized!');
-      return [];
-    }
-    _debugFrameCounter++;
-    final bool shouldLog = _debugFrameCounter % 30 == 1; // Log every 30th call
-    if (shouldLog) {
-      print(
-        'DEBUG: Processing frame #$_debugFrameCounter (${imageWidth}x$imageHeight)',
-      );
-    }
+    if (!_isInitialized) return [];
 
     try {
-      // Convert CameraImage to RGB bytes
-      final rgbBytes = _convertCameraImage(cameraImage);
-      if (rgbBytes == null) {
-        if (shouldLog) print('DEBUG: Image conversion returned null!');
-        return [];
-      }
-      if (shouldLog) {
-        print('DEBUG: Image converted, bytes length: ${rgbBytes.length}');
-      }
+      // 1. YUV→RGB
+      final rgbBytes = _convertToRgb(imageWidth, imageHeight, format, planes);
+      if (rgbBytes == null) return [];
 
-      // Run YOLO detection
-      final detections = _runYoloInference(rgbBytes, imageWidth, imageHeight);
-      if (shouldLog) {
-        print('DEBUG: YOLO returned ${detections.length} raw detections');
+      // 2. YOLO inference (synchronous, but camera stream is stopped)
+      final detections = _runYolo(rgbBytes, imageWidth, imageHeight);
+
+      // 3. MiDaS inference (optional)
+      Float32List? depthMap;
+      if (midasEnabled) {
+        depthMap = _runMidas(rgbBytes, imageWidth, imageHeight);
       }
 
-      // Run MiDaS depth estimation only if enabled
-      final Float32List? depthMap = midasEnabled
-          ? _runMidasInference(rgbBytes, imageWidth, imageHeight)
-          : null;
-
-      // Combine detections with depth
+      // 4. Combine
       final results = <DetectionResult>[];
       for (final det in detections) {
         double distance = 999.0;
-
         if (depthMap != null) {
-          final centerX = ((det['x1'] + det['x2']) / 2)
+          final cx = ((det['x1'] + det['x2']) / 2)
               .clamp(0, imageWidth - 1)
               .toInt();
-          final centerY = ((det['y1'] + det['y2']) / 2)
+          final cy = ((det['y1'] + det['y2']) / 2)
               .clamp(0, imageHeight - 1)
               .toInt();
-
-          // Sample depth at center of bounding box
-          final depthX = (centerX * midasInputSize / imageWidth).toInt().clamp(
+          final dx = (cx * midasInputSize / imageWidth).toInt().clamp(
             0,
             midasInputSize - 1,
           );
-          final depthY = (centerY * midasInputSize / imageHeight).toInt().clamp(
+          final dy = (cy * midasInputSize / imageHeight).toInt().clamp(
             0,
             midasInputSize - 1,
           );
-          final depthValue = depthMap[depthY * midasInputSize + depthX];
-
-          // Convert inverse depth to approximate distance
-          distance = depthValue > 0 ? 1000.0 / depthValue : 999.0;
+          final dv = depthMap[dy * midasInputSize + dx];
+          distance = dv > 0 ? 1000.0 / dv : 999.0;
         }
-
         results.add(
           DetectionResult(
             className: det['name'] as String,
@@ -171,17 +214,7 @@ class TfliteService {
           ),
         );
       }
-
-      // Sort by priority (closest first)
       results.sort((a, b) => a.priority.compareTo(b.priority));
-      if (shouldLog) print('DEBUG: Final results count: ${results.length}');
-      if (shouldLog && results.isNotEmpty) {
-        for (final r in results) {
-          print(
-            'DEBUG:   ${r.className} conf=${r.confidence.toStringAsFixed(3)} dist=${r.depthValue.toStringAsFixed(1)}',
-          );
-        }
-      }
       return results;
     } catch (e) {
       print('Detection error: $e');
@@ -189,131 +222,51 @@ class TfliteService {
     }
   }
 
-  /// Convert CameraImage (YUV420) to RGB Float32List for model input
-  Uint8List? _convertCameraImage(CameraImage image) {
-    try {
-      final int width = image.width;
-      final int height = image.height;
-      final rgbBytes = Uint8List(width * height * 3);
+  // ─── YOLO inference ──────────────────────────────────────────────────────────
 
-      // Handle YUV420 format (most common on Android)
-      if (image.format.group == ImageFormatGroup.yuv420) {
-        final yPlane = image.planes[0];
-        final uPlane = image.planes[1];
-        final vPlane = image.planes[2];
-
-        for (int y = 0; y < height; y++) {
-          for (int x = 0; x < width; x++) {
-            final yIndex = y * yPlane.bytesPerRow + x;
-            final uvIndex = (y ~/ 2) * uPlane.bytesPerRow + (x ~/ 2);
-
-            final yVal = yPlane.bytes[yIndex];
-            final uVal = uPlane.bytes[uvIndex];
-            final vVal = vPlane.bytes[uvIndex];
-
-            final r = (yVal + 1.370705 * (vVal - 128)).clamp(0, 255).toInt();
-            final g = (yVal - 0.337633 * (uVal - 128) - 0.698001 * (vVal - 128))
-                .clamp(0, 255)
-                .toInt();
-            final b = (yVal + 1.732446 * (uVal - 128)).clamp(0, 255).toInt();
-
-            final idx = (y * width + x) * 3;
-            rgbBytes[idx] = r;
-            rgbBytes[idx + 1] = g;
-            rgbBytes[idx + 2] = b;
-          }
-        }
-      } else if (image.format.group == ImageFormatGroup.bgra8888) {
-        final bytes = image.planes[0].bytes;
-        for (int i = 0, j = 0; i < bytes.length; i += 4, j += 3) {
-          rgbBytes[j] = bytes[i + 2]; // R
-          rgbBytes[j + 1] = bytes[i + 1]; // G
-          rgbBytes[j + 2] = bytes[i]; // B
-        }
-      }
-
-      return rgbBytes;
-    } catch (e) {
-      print('Image conversion error: $e');
-      return null;
-    }
-  }
-
-  /// Run YOLO inference and return raw detections
-  List<Map<String, dynamic>> _runYoloInference(
+  List<Map<String, dynamic>> _runYolo(
     Uint8List rgbBytes,
     int imageWidth,
     int imageHeight,
   ) {
     if (_yoloInterpreter == null) return [];
-
-    // Get input/output shapes
     final inputShape = _yoloInterpreter!.getInputTensor(0).shape;
     final inputH = inputShape[1];
     final inputW = inputShape[2];
 
-    // Preprocess: resize + normalize to [0,1]
     final input = Float32List(1 * inputH * inputW * 3);
     for (int y = 0; y < inputH; y++) {
       for (int x = 0; x < inputW; x++) {
-        final srcX = (x * imageWidth / inputW).toInt().clamp(0, imageWidth - 1);
-        final srcY = (y * imageHeight / inputH).toInt().clamp(
-          0,
-          imageHeight - 1,
-        );
-        final srcIdx = (srcY * imageWidth + srcX) * 3;
-        final dstIdx = (y * inputW + x) * 3;
-
-        input[dstIdx] = rgbBytes[srcIdx] / 255.0;
-        input[dstIdx + 1] = rgbBytes[srcIdx + 1] / 255.0;
-        input[dstIdx + 2] = rgbBytes[srcIdx + 2] / 255.0;
+        final sx = (x * imageWidth / inputW).toInt().clamp(0, imageWidth - 1);
+        final sy = (y * imageHeight / inputH).toInt().clamp(0, imageHeight - 1);
+        final si = (sy * imageWidth + sx) * 3;
+        final di = (y * inputW + x) * 3;
+        input[di] = rgbBytes[si] / 255.0;
+        input[di + 1] = rgbBytes[si + 1] / 255.0;
+        input[di + 2] = rgbBytes[si + 2] / 255.0;
       }
     }
 
-    // Reshape for model input [1, H, W, 3]
     final inputTensor = input.reshape([1, inputH, inputW, 3]);
-
-    // Get output shape and allocate output
     final outputShape = _yoloInterpreter!.getOutputTensor(0).shape;
-    // YOLO output: [1, 16, 8400] means transposed format: [1, 4+num_classes, num_detections]
-    print('DEBUG YOLO: inputShape=$inputShape, outputShape=$outputShape');
+    final dim1 = outputShape[1];
+    final dim2 = outputShape[2];
 
-    // Allocate output as nested List to match tflite_flutter expectations
-    // For shape [1, 16, 8400], create List<List<List<double>>>
     final output = List.generate(
-      outputShape[0],
-      (_) => List.generate(
-        outputShape[1],
-        (_) => List.filled(outputShape[2], 0.0),
-      ),
+      1,
+      (_) => List.generate(dim1, (_) => List<double>.filled(dim2, 0.0)),
     );
-
-    // Run inference
     _yoloInterpreter!.run(inputTensor, output);
 
-    // Flatten the nested output to Float32List for parsing
-    final outputSize = outputShape.reduce((a, b) => a * b);
-    final outputFlat = Float32List(outputSize);
+    final flat = Float32List(dim1 * dim2);
     int idx = 0;
-    for (int i = 0; i < outputShape[1]; i++) {
-      for (int j = 0; j < outputShape[2]; j++) {
-        outputFlat[idx++] = output[0][i][j].toDouble();
+    for (int i = 0; i < dim1; i++) {
+      for (int j = 0; j < dim2; j++) {
+        flat[idx++] = output[0][i][j];
       }
     }
-
-    // Debug: check output statistics
-    double maxVal = -1e9, minVal = 1e9;
-    for (int i = 0; i < outputFlat.length; i++) {
-      if (outputFlat[i] > maxVal) maxVal = outputFlat[i];
-      if (outputFlat[i] < minVal) minVal = outputFlat[i];
-    }
-    print(
-      'DEBUG YOLO: output stats min=$minVal max=$maxVal, totalElements=${outputFlat.length}',
-    );
-
-    // Parse YOLO output
-    return _parseYoloOutput(
-      outputFlat,
+    return _parseYolo(
+      flat,
       outputShape,
       imageWidth,
       imageHeight,
@@ -322,205 +275,190 @@ class TfliteService {
     );
   }
 
-  /// Parse YOLO TFLite output
-  List<Map<String, dynamic>> _parseYoloOutput(
-    Float32List output,
+  // ─── Output parsing ──────────────────────────────────────────────────────────
+
+  List<Map<String, dynamic>> _parseYolo(
+    Float32List flat,
     List<int> shape,
     int imageWidth,
     int imageHeight,
     int inputW,
     int inputH,
   ) {
-    final detections = <Map<String, dynamic>>[];
+    if (shape.length != 3) return [];
+    final nc = classNames.length;
+    final dim1 = shape[1], dim2 = shape[2];
 
-    if (shape.length != 3) return detections;
-
-    final dim1 = shape[1];
-    final dim2 = shape[2];
-
-    // Determine format: [1, num_detections, 4+nc] or [1, 4+nc, num_detections]
-    final numClasses = classNames.length;
-    bool transposed = false;
-    int numDetections;
-
-    if (dim2 == 4 + numClasses) {
-      // Standard format: [1, num_detections, 4 + numClasses]
-      numDetections = dim1;
-    } else if (dim1 == 4 + numClasses) {
-      // Transposed format: [1, 4 + numClasses, num_detections]
+    bool transposed;
+    int numDet;
+    if (dim2 == 4 + nc) {
+      transposed = false;
+      numDet = dim1;
+    } else if (dim1 == 4 + nc) {
       transposed = true;
-      numDetections = dim2;
+      numDet = dim2;
     } else {
-      // Try to figure out which dim is the detection dim
-      // Assume the larger dimension is num_detections
-      if (dim1 > dim2) {
-        numDetections = dim1;
-      } else {
-        transposed = true;
-        numDetections = dim2;
-      }
+      transposed = dim2 > dim1;
+      numDet = transposed ? dim2 : dim1;
     }
 
-    for (int i = 0; i < numDetections; i++) {
-      double cx, cy, w, h;
-      List<double> classScores = [];
-
+    final detections = <Map<String, dynamic>>[];
+    for (int i = 0; i < numDet; i++) {
+      double cx, cy, bw, bh, maxScore = -1;
+      int maxIdx = 0;
       if (transposed) {
-        cx = output[0 * numDetections + i];
-        cy = output[1 * numDetections + i];
-        w = output[2 * numDetections + i];
-        h = output[3 * numDetections + i];
-        for (int c = 0; c < numClasses; c++) {
-          classScores.add(output[(4 + c) * numDetections + i]);
+        cx = flat[0 * numDet + i];
+        cy = flat[1 * numDet + i];
+        bw = flat[2 * numDet + i];
+        bh = flat[3 * numDet + i];
+        for (int c = 0; c < nc; c++) {
+          final s = flat[(4 + c) * numDet + i];
+          if (s > maxScore) {
+            maxScore = s;
+            maxIdx = c;
+          }
         }
       } else {
-        final stride = 4 + numClasses;
-        cx = output[i * stride + 0];
-        cy = output[i * stride + 1];
-        w = output[i * stride + 2];
-        h = output[i * stride + 3];
-        for (int c = 0; c < numClasses; c++) {
-          classScores.add(output[i * stride + 4 + c]);
+        final stride = 4 + nc;
+        cx = flat[i * stride];
+        cy = flat[i * stride + 1];
+        bw = flat[i * stride + 2];
+        bh = flat[i * stride + 3];
+        for (int c = 0; c < nc; c++) {
+          final s = flat[i * stride + 4 + c];
+          if (s > maxScore) {
+            maxScore = s;
+            maxIdx = c;
+          }
         }
       }
-
-      // Find max class score
-      double maxScore = -1;
-      int maxIdx = 0;
-      for (int c = 0; c < classScores.length; c++) {
-        if (classScores[c] > maxScore) {
-          maxScore = classScores[c];
-          maxIdx = c;
-        }
-      }
-
-      if (maxScore < confidenceThreshold) continue;
-      print(
-        'DEBUG YOLO: Detection found! class=$maxIdx (${maxIdx < classNames.length ? classNames[maxIdx] : "?"}) score=$maxScore cx=$cx cy=$cy w=$w h=$h',
-      );
-
-      // Convert from center format to corner format, scale to image size
+      if (maxScore < _confidenceThreshold) continue;
       final scaleX = imageWidth / inputW;
       final scaleY = imageHeight / inputH;
-
-      final x1 = (cx - w / 2) * scaleX;
-      final y1 = (cy - h / 2) * scaleY;
-      final x2 = (cx + w / 2) * scaleX;
-      final y2 = (cy + h / 2) * scaleY;
-
       detections.add({
-        'x1': x1.clamp(0.0, imageWidth.toDouble()),
-        'y1': y1.clamp(0.0, imageHeight.toDouble()),
-        'x2': x2.clamp(0.0, imageWidth.toDouble()),
-        'y2': y2.clamp(0.0, imageHeight.toDouble()),
+        'x1': ((cx - bw / 2) * scaleX).clamp(0.0, imageWidth.toDouble()),
+        'y1': ((cy - bh / 2) * scaleY).clamp(0.0, imageHeight.toDouble()),
+        'x2': ((cx + bw / 2) * scaleX).clamp(0.0, imageWidth.toDouble()),
+        'y2': ((cy + bh / 2) * scaleY).clamp(0.0, imageHeight.toDouble()),
         'conf': maxScore,
         'classIdx': maxIdx,
-        'name': maxIdx < classNames.length ? classNames[maxIdx] : 'Unknown',
+        'name': maxIdx < nc ? classNames[maxIdx] : 'Unknown',
       });
     }
-
-    // Apply NMS
     return _nms(detections);
   }
 
-  /// Non-maximum suppression
-  List<Map<String, dynamic>> _nms(List<Map<String, dynamic>> detections) {
-    if (detections.isEmpty) return detections;
+  // ─── NMS ─────────────────────────────────────────────────────────────────────
 
-    // Sort by confidence descending
-    detections.sort(
-      (a, b) => (b['conf'] as double).compareTo(a['conf'] as double),
-    );
-
+  List<Map<String, dynamic>> _nms(List<Map<String, dynamic>> dets) {
+    if (dets.isEmpty) return dets;
+    dets.sort((a, b) => (b['conf'] as double).compareTo(a['conf'] as double));
     final selected = <Map<String, dynamic>>[];
-    final suppressed = List<bool>.filled(detections.length, false);
-
-    for (int i = 0; i < detections.length; i++) {
+    final suppressed = List<bool>.filled(dets.length, false);
+    for (int i = 0; i < dets.length; i++) {
       if (suppressed[i]) continue;
-      selected.add(detections[i]);
-
-      for (int j = i + 1; j < detections.length; j++) {
-        if (suppressed[j]) continue;
-        if (_iou(detections[i], detections[j]) > iouThreshold) {
-          suppressed[j] = true;
+      selected.add(dets[i]);
+      for (int j = i + 1; j < dets.length; j++) {
+        if (!suppressed[j]) {
+          final ax1 = dets[i]['x1'] as double, ay1 = dets[i]['y1'] as double;
+          final ax2 = dets[i]['x2'] as double, ay2 = dets[i]['y2'] as double;
+          final bx1 = dets[j]['x1'] as double, by1 = dets[j]['y1'] as double;
+          final bx2 = dets[j]['x2'] as double, by2 = dets[j]['y2'] as double;
+          final inter =
+              max(0.0, min(ax2, bx2) - max(ax1, bx1)) *
+              max(0.0, min(ay2, by2) - max(ay1, by1));
+          final union =
+              (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter;
+          if (union > 0 && inter / union > _iouThreshold) suppressed[j] = true;
         }
       }
     }
-
     return selected;
   }
 
-  /// Calculate Intersection over Union
-  double _iou(Map<String, dynamic> a, Map<String, dynamic> b) {
-    final x1 = max(a['x1'] as double, b['x1'] as double);
-    final y1 = max(a['y1'] as double, b['y1'] as double);
-    final x2 = min(a['x2'] as double, b['x2'] as double);
-    final y2 = min(a['y2'] as double, b['y2'] as double);
+  // ─── YUV → RGB ───────────────────────────────────────────────────────────────
 
-    final intersection = max(0.0, x2 - x1) * max(0.0, y2 - y1);
-    final areaA = (a['x2'] - a['x1']) * (a['y2'] - a['y1']);
-    final areaB = (b['x2'] - b['x1']) * (b['y2'] - b['y1']);
-    final union = areaA + areaB - intersection;
-
-    return union > 0 ? intersection / union : 0;
-  }
-
-  /// Run MiDaS depth estimation
-  Float32List _runMidasInference(
-    Uint8List rgbBytes,
-    int imageWidth,
-    int imageHeight,
+  Uint8List? _convertToRgb(
+    int w,
+    int h,
+    ImageFormatGroup format,
+    List<CameraPlane> planes,
   ) {
-    if (_midasInterpreter == null) {
-      return Float32List(midasInputSize * midasInputSize);
-    }
-
-    // Preprocess: resize + normalize with MiDaS-specific values
-    final input = Float32List(1 * midasInputSize * midasInputSize * 3);
-    const mean = [0.485, 0.456, 0.406];
-    const std = [0.229, 0.224, 0.225];
-
-    for (int y = 0; y < midasInputSize; y++) {
-      for (int x = 0; x < midasInputSize; x++) {
-        final srcX = (x * imageWidth / midasInputSize).toInt().clamp(
-          0,
-          imageWidth - 1,
-        );
-        final srcY = (y * imageHeight / midasInputSize).toInt().clamp(
-          0,
-          imageHeight - 1,
-        );
-        final srcIdx = (srcY * imageWidth + srcX) * 3;
-        final dstIdx = (y * midasInputSize + x) * 3;
-
-        input[dstIdx] = (rgbBytes[srcIdx] / 255.0 - mean[0]) / std[0];
-        input[dstIdx + 1] = (rgbBytes[srcIdx + 1] / 255.0 - mean[1]) / std[1];
-        input[dstIdx + 2] = (rgbBytes[srcIdx + 2] / 255.0 - mean[2]) / std[2];
+    try {
+      final rgb = Uint8List(w * h * 3);
+      if (format == ImageFormatGroup.yuv420 && planes.length >= 2) {
+        final yP = planes[0], uP = planes[1];
+        final hasV = planes.length >= 3;
+        final vP = hasV ? planes[2] : planes[1];
+        for (int y = 0; y < h; y++) {
+          for (int x = 0; x < w; x++) {
+            final yi = y * yP.bytesPerRow + x;
+            final uvi = (y ~/ 2) * uP.bytesPerRow + (x ~/ 2);
+            final yv = yP.bytes[yi];
+            final uv = uP.bytes[uvi];
+            final vv = hasV ? vP.bytes[uvi] : uP.bytes[uvi + 1];
+            final idx = (y * w + x) * 3;
+            rgb[idx] = (yv + 1.370705 * (vv - 128)).clamp(0, 255).toInt();
+            rgb[idx + 1] = (yv - 0.337633 * (uv - 128) - 0.698001 * (vv - 128))
+                .clamp(0, 255)
+                .toInt();
+            rgb[idx + 2] = (yv + 1.732446 * (uv - 128)).clamp(0, 255).toInt();
+          }
+        }
+      } else if (format == ImageFormatGroup.bgra8888 && planes.isNotEmpty) {
+        final bytes = planes[0].bytes;
+        for (int i = 0, j = 0; i < bytes.length; i += 4, j += 3) {
+          rgb[j] = bytes[i + 2];
+          rgb[j + 1] = bytes[i + 1];
+          rgb[j + 2] = bytes[i];
+        }
       }
+      return rgb;
+    } catch (e) {
+      print('Image conversion error: $e');
+      return null;
     }
-
-    final inputTensor = input.reshape([1, midasInputSize, midasInputSize, 3]);
-    final output = Float32List(
-      midasInputSize * midasInputSize,
-    ).reshape([1, midasInputSize, midasInputSize]);
-
-    _midasInterpreter!.run(inputTensor, output);
-
-    // Flatten output
-    final depthMap = Float32List(midasInputSize * midasInputSize);
-    for (int y = 0; y < midasInputSize; y++) {
-      for (int x = 0; x < midasInputSize; x++) {
-        depthMap[y * midasInputSize + x] = (output[0] as List)[y][x];
-      }
-    }
-
-    return depthMap;
   }
 
-  /// Clean up resources
+  // ─── Cleanup ─────────────────────────────────────────────────────────────────
+
   void dispose() {
     _yoloInterpreter?.close();
     _midasInterpreter?.close();
     _isInitialized = false;
+  }
+
+  // ─── MiDaS inference ─────────────────────────────────────────────────────────
+
+  Float32List _runMidas(Uint8List rgbBytes, int imageWidth, int imageHeight) {
+    const sz = midasInputSize;
+    if (_midasInterpreter == null) return Float32List(sz * sz);
+    final input = Float32List(1 * sz * sz * 3);
+    const mean = [0.485, 0.456, 0.406];
+    const std = [0.229, 0.224, 0.225];
+    for (int y = 0; y < sz; y++) {
+      for (int x = 0; x < sz; x++) {
+        final sx = (x * imageWidth / sz).toInt().clamp(0, imageWidth - 1);
+        final sy = (y * imageHeight / sz).toInt().clamp(0, imageHeight - 1);
+        final si = (sy * imageWidth + sx) * 3;
+        final di = (y * sz + x) * 3;
+        input[di] = (rgbBytes[si] / 255.0 - mean[0]) / std[0];
+        input[di + 1] = (rgbBytes[si + 1] / 255.0 - mean[1]) / std[1];
+        input[di + 2] = (rgbBytes[si + 2] / 255.0 - mean[2]) / std[2];
+      }
+    }
+    final inputTensor = input.reshape([1, sz, sz, 3]);
+    final output = List.generate(
+      1,
+      (_) => List.generate(sz, (_) => List<double>.filled(sz, 0.0)),
+    );
+    _midasInterpreter!.run(inputTensor, output);
+    final depth = Float32List(sz * sz);
+    for (int y = 0; y < sz; y++) {
+      for (int x = 0; x < sz; x++) {
+        depth[y * sz + x] = output[0][y][x];
+      }
+    }
+    return depth;
   }
 }

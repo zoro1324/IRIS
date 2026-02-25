@@ -14,10 +14,11 @@ class AlertService {
   bool _isSpeaking = false;
   bool _vibrationEnabled = true;
   bool _ttsEnabled = true;
+  bool? _hasVibrator;
 
   /// Cooldown per class to prevent alert spam
   final Map<String, DateTime> _cooldowns = {};
-  static const Duration _cooldownDuration = Duration(seconds: 3);
+  static const Duration _cooldownDuration = Duration(seconds: 5);
   static const Duration _urgentCooldownDuration = Duration(milliseconds: 1500);
 
   bool get isInitialized => _isInitialized;
@@ -36,9 +37,11 @@ class AlertService {
     _tts.setCompletionHandler(() {
       _isSpeaking = false;
     });
+    // Cache vibration availability once
+    _hasVibrator = await Vibration.hasVibrator();
 
     _isInitialized = true;
-    print('Alert service initialized');
+    print('Alert service initialized (vibrator=$_hasVibrator)');
   }
 
   /// Toggle vibration feedback
@@ -87,9 +90,8 @@ class AlertService {
   }
 
   /// Trigger haptic feedback based on distance
-  void _triggerHaptic(DistanceCategory category) async {
-    final hasVibrator = await Vibration.hasVibrator();
-    if (hasVibrator != true) return;
+  void _triggerHaptic(DistanceCategory category) {
+    if (_hasVibrator != true) return;
 
     switch (category) {
       case DistanceCategory.veryClose:

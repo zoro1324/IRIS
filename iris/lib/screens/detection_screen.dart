@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:typed_data';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -29,10 +30,11 @@ class _DetectionScreenState extends State<DetectionScreen>
   bool _isProcessing = false;
   bool _midasEnabled = true;
   String _statusMessage = 'Initializing...';
-  int _frameCount = 0;
 
-  // Throttle: process every Nth frame (~5 FPS from 30 FPS stream)
-  static const int _processEveryNthFrame = 6;
+  // Detection loop timer — fires every N ms to capture a single frame
+  Timer? _detectionTimer;
+  // Interval between inference cycles (ms)
+  int get _inferenceIntervalMs => _midasEnabled ? 800 : 400;
 
   @override
   void initState() {
@@ -100,7 +102,8 @@ class _DetectionScreenState extends State<DetectionScreen>
 
       _cameraController = CameraController(
         backCamera,
-        ResolutionPreset.medium, // Balance quality vs performance
+        ResolutionPreset
+            .low, // 320×240 — model resizes anyway; smaller = faster YUV→RGB
         enableAudio: false,
         imageFormatGroup: ImageFormatGroup.yuv420,
       );
@@ -127,49 +130,98 @@ class _DetectionScreenState extends State<DetectionScreen>
 
   void _startDetection() {
     if (!_isCameraReady || _isDetecting) return;
-
     setState(() => _isDetecting = true);
-    _frameCount = 0;
+    // Start the capture loop
+    _scheduleNextCapture();
+  }
 
-    _cameraController!.startImageStream((CameraImage image) {
-      _frameCount++;
-      if (_frameCount % _processEveryNthFrame != 0) return;
-      if (_isProcessing) return;
-
-      _processFrame(image);
+  /// Schedule the next single-frame capture after a delay.
+  void _scheduleNextCapture() {
+    if (!_isDetecting || !mounted) return;
+    _detectionTimer = Timer(Duration(milliseconds: _inferenceIntervalMs), () {
+      if (!_isDetecting || !mounted) return;
+      _captureAndProcess();
     });
   }
 
+  /// Capture ONE frame, stop the stream, run inference, then schedule next.
+  Future<void> _captureAndProcess() async {
+    if (!_isCameraReady || _isProcessing) {
+      _scheduleNextCapture();
+      return;
+    }
+    _isProcessing = true;
+
+    try {
+      // Start stream to grab a single frame
+      Completer<void> frameGrabbed = Completer<void>();
+      int? frameW, frameH;
+      ImageFormatGroup? frameFormat;
+      List<CameraPlane>? framePlanes;
+
+      _cameraController!.startImageStream((CameraImage image) {
+        if (frameGrabbed.isCompleted) return;
+        // Copy bytes synchronously
+        frameW = image.width;
+        frameH = image.height;
+        frameFormat = image.format.group;
+        framePlanes = image.planes
+            .map(
+              (p) => CameraPlane(
+                bytes: Uint8List.fromList(p.bytes),
+                bytesPerRow: p.bytesPerRow,
+              ),
+            )
+            .toList();
+        frameGrabbed.complete();
+      });
+
+      // Wait for the first frame (with timeout)
+      await frameGrabbed.future.timeout(
+        const Duration(seconds: 2),
+        onTimeout: () {},
+      );
+
+      // Stop the stream immediately — free the camera HAL + GPU
+      await _cameraController!.stopImageStream();
+
+      // Run inference (camera is stopped, no GPU contention)
+      if (framePlanes != null && frameW != null) {
+        final results = await _tfliteService.detectObjects(
+          frameW!,
+          frameH!,
+          frameFormat!,
+          framePlanes!,
+        );
+
+        if (mounted) {
+          setState(() => _detections = results);
+          // Fire-and-forget TTS
+          unawaited(_alertService.processDetections(results));
+        }
+      }
+    } catch (e) {
+      print('Capture error: $e');
+    } finally {
+      _isProcessing = false;
+      // Schedule next capture
+      _scheduleNextCapture();
+    }
+  }
+
   void _stopDetection() {
+    _detectionTimer?.cancel();
+    _detectionTimer = null;
     if (_isDetecting) {
-      _cameraController?.stopImageStream();
+      try {
+        _cameraController?.stopImageStream();
+      } catch (_) {}
       setState(() {
         _isDetecting = false;
         _detections = [];
       });
       _alertService.stop();
       _alertService.resetCooldowns();
-    }
-  }
-
-  Future<void> _processFrame(CameraImage image) async {
-    _isProcessing = true;
-
-    try {
-      final results = await _tfliteService.detectObjects(
-        image,
-        image.width,
-        image.height,
-      );
-
-      if (mounted) {
-        setState(() => _detections = results);
-        await _alertService.processDetections(results);
-      }
-    } catch (e) {
-      print('Frame processing error: $e');
-    } finally {
-      _isProcessing = false;
     }
   }
 
@@ -374,43 +426,6 @@ class _DetectionScreenState extends State<DetectionScreen>
                     ),
                   ),
                 const SizedBox(width: 8),
-                // MiDaS toggle button
-                Semantics(
-                  label: _midasEnabled
-                      ? 'Depth estimation on. Double tap to turn off.'
-                      : 'Depth estimation off. Double tap to turn on.',
-                  button: true,
-                  child: GestureDetector(
-                    onTap: () {
-                      setState(() {
-                        _midasEnabled = !_midasEnabled;
-                        _tfliteService.midasEnabled = _midasEnabled;
-                      });
-                    },
-                    child: AnimatedContainer(
-                      duration: const Duration(milliseconds: 250),
-                      padding: const EdgeInsets.all(10),
-                      decoration: BoxDecoration(
-                        color: _midasEnabled
-                            ? const Color(0xFF6C63FF).withOpacity(0.3)
-                            : Colors.white.withOpacity(0.08),
-                        borderRadius: BorderRadius.circular(12),
-                        border: Border.all(
-                          color: _midasEnabled
-                              ? const Color(0xFF6C63FF).withOpacity(0.6)
-                              : Colors.white.withOpacity(0.15),
-                        ),
-                      ),
-                      child: Icon(
-                        Icons.layers_rounded,
-                        color: _midasEnabled
-                            ? const Color(0xFF6C63FF)
-                            : Colors.white38,
-                        size: 20,
-                      ),
-                    ),
-                  ),
-                ),
               ],
             ),
           ),
@@ -425,6 +440,123 @@ class _DetectionScreenState extends State<DetectionScreen>
             mainAxisSize: MainAxisSize.min,
             children: [
               AlertPanel(detections: _detections),
+              // MiDaS depth toggle row
+              Container(
+                color: Colors.black.withOpacity(0.85),
+                padding: const EdgeInsets.fromLTRB(20, 8, 20, 0),
+                child: Semantics(
+                  label: _midasEnabled
+                      ? 'Depth estimation is on. Tap to disable for faster detection.'
+                      : 'Depth estimation is off. Tap to enable.',
+                  button: true,
+                  child: GestureDetector(
+                    onTap: () {
+                      setState(() {
+                        _midasEnabled = !_midasEnabled;
+                        _tfliteService.midasEnabled = _midasEnabled;
+                      });
+                      _alertService.speak(
+                        _midasEnabled
+                            ? 'Depth estimation enabled'
+                            : 'Depth estimation disabled',
+                      );
+                    },
+                    child: AnimatedContainer(
+                      duration: const Duration(milliseconds: 250),
+                      width: double.infinity,
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 10,
+                      ),
+                      decoration: BoxDecoration(
+                        color: _midasEnabled
+                            ? const Color(0xFF6C63FF).withOpacity(0.15)
+                            : Colors.white.withOpacity(0.05),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: _midasEnabled
+                              ? const Color(0xFF6C63FF).withOpacity(0.5)
+                              : Colors.white.withOpacity(0.12),
+                        ),
+                      ),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Row(
+                            children: [
+                              Icon(
+                                Icons.layers_rounded,
+                                color: _midasEnabled
+                                    ? const Color(0xFF6C63FF)
+                                    : Colors.white38,
+                                size: 18,
+                              ),
+                              const SizedBox(width: 10),
+                              Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    'Depth Estimation (MiDaS)',
+                                    style: TextStyle(
+                                      color: _midasEnabled
+                                          ? Colors.white
+                                          : Colors.white54,
+                                      fontSize: 13,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                  Text(
+                                    _midasEnabled
+                                        ? 'ON  •  ~5 FPS'
+                                        : 'OFF  •  ~10 FPS (faster)',
+                                    style: TextStyle(
+                                      color: _midasEnabled
+                                          ? const Color(
+                                              0xFF6C63FF,
+                                            ).withOpacity(0.8)
+                                          : Colors.white30,
+                                      fontSize: 11,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
+                          AnimatedContainer(
+                            duration: const Duration(milliseconds: 250),
+                            width: 44,
+                            height: 26,
+                            decoration: BoxDecoration(
+                              borderRadius: BorderRadius.circular(13),
+                              color: _midasEnabled
+                                  ? const Color(0xFF6C63FF)
+                                  : Colors.white24,
+                            ),
+                            child: AnimatedAlign(
+                              duration: const Duration(milliseconds: 250),
+                              alignment: _midasEnabled
+                                  ? Alignment.centerRight
+                                  : Alignment.centerLeft,
+                              child: Container(
+                                width: 20,
+                                height: 20,
+                                margin: const EdgeInsets.symmetric(
+                                  horizontal: 3,
+                                ),
+                                decoration: const BoxDecoration(
+                                  shape: BoxShape.circle,
+                                  color: Colors.white,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 8),
               // Stop button
               Container(
                 color: Colors.black.withOpacity(0.85),
