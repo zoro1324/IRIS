@@ -31,8 +31,8 @@ class _DetectionScreenState extends State<DetectionScreen>
   bool _midasEnabled = true;
   String _statusMessage = 'Initializing...';
 
-  // Detection loop timer — fires every N ms to capture a single frame
-  Timer? _detectionTimer;
+  // Timestamp-based throttle — replaces the old start/stop stream pattern
+  DateTime _lastProcessedTime = DateTime.fromMillisecondsSinceEpoch(0);
   // Interval between inference cycles (ms)
   int get _inferenceIntervalMs => _midasEnabled ? 800 : 400;
 
@@ -128,90 +128,74 @@ class _DetectionScreenState extends State<DetectionScreen>
     }
   }
 
+  /// Start the camera stream ONCE and keep it running.
+  /// Frames are throttled via [_onCameraFrame].
   void _startDetection() {
     if (!_isCameraReady || _isDetecting) return;
     setState(() => _isDetecting = true);
-    // Start the capture loop
-    _scheduleNextCapture();
+    _cameraController!.startImageStream(_onCameraFrame);
   }
 
-  /// Schedule the next single-frame capture after a delay.
-  void _scheduleNextCapture() {
-    if (!_isDetecting || !mounted) return;
-    _detectionTimer = Timer(Duration(milliseconds: _inferenceIntervalMs), () {
-      if (!_isDetecting || !mounted) return;
-      _captureAndProcess();
-    });
-  }
+  /// Stream callback — runs on every camera frame.
+  /// Drops frames if inference is still running or interval hasn't elapsed.
+  void _onCameraFrame(CameraImage image) {
+    // Still processing the previous frame — drop this one
+    if (_isProcessing) return;
 
-  /// Capture ONE frame, stop the stream, run inference, then schedule next.
-  Future<void> _captureAndProcess() async {
-    if (!_isCameraReady || _isProcessing) {
-      _scheduleNextCapture();
+    // Throttle: skip frames until the inference interval has elapsed
+    final now = DateTime.now();
+    if (now.difference(_lastProcessedTime).inMilliseconds <
+        _inferenceIntervalMs) {
       return;
     }
+    _lastProcessedTime = now;
     _isProcessing = true;
 
+    // Copy plane bytes synchronously (before the platform recycles them)
+    final frameW = image.width;
+    final frameH = image.height;
+    final frameFormat = image.format.group;
+    final framePlanes = image.planes
+        .map(
+          (p) => CameraPlane(
+            bytes: Uint8List.fromList(p.bytes),
+            bytesPerRow: p.bytesPerRow,
+          ),
+        )
+        .toList();
+
+    // Run inference asynchronously
+    _processFrame(frameW, frameH, frameFormat, framePlanes);
+  }
+
+  /// Run YOLO + MiDaS on copied frame data, then update UI.
+  Future<void> _processFrame(
+    int frameW,
+    int frameH,
+    ImageFormatGroup frameFormat,
+    List<CameraPlane> framePlanes,
+  ) async {
     try {
-      // Start stream to grab a single frame
-      Completer<void> frameGrabbed = Completer<void>();
-      int? frameW, frameH;
-      ImageFormatGroup? frameFormat;
-      List<CameraPlane>? framePlanes;
-
-      _cameraController!.startImageStream((CameraImage image) {
-        if (frameGrabbed.isCompleted) return;
-        // Copy bytes synchronously
-        frameW = image.width;
-        frameH = image.height;
-        frameFormat = image.format.group;
-        framePlanes = image.planes
-            .map(
-              (p) => CameraPlane(
-                bytes: Uint8List.fromList(p.bytes),
-                bytesPerRow: p.bytesPerRow,
-              ),
-            )
-            .toList();
-        frameGrabbed.complete();
-      });
-
-      // Wait for the first frame (with timeout)
-      await frameGrabbed.future.timeout(
-        const Duration(seconds: 2),
-        onTimeout: () {},
+      final results = await _tfliteService.detectObjects(
+        frameW,
+        frameH,
+        frameFormat,
+        framePlanes,
       );
 
-      // Stop the stream immediately — free the camera HAL + GPU
-      await _cameraController!.stopImageStream();
-
-      // Run inference (camera is stopped, no GPU contention)
-      if (framePlanes != null && frameW != null) {
-        final results = await _tfliteService.detectObjects(
-          frameW!,
-          frameH!,
-          frameFormat!,
-          framePlanes!,
-        );
-
-        if (mounted) {
-          setState(() => _detections = results);
-          // Fire-and-forget TTS
-          unawaited(_alertService.processDetections(results));
-        }
+      if (mounted) {
+        setState(() => _detections = results);
+        // Fire-and-forget TTS
+        unawaited(_alertService.processDetections(results));
       }
     } catch (e) {
-      print('Capture error: $e');
+      print('Detection error: $e');
     } finally {
       _isProcessing = false;
-      // Schedule next capture
-      _scheduleNextCapture();
     }
   }
 
   void _stopDetection() {
-    _detectionTimer?.cancel();
-    _detectionTimer = null;
     if (_isDetecting) {
       try {
         _cameraController?.stopImageStream();

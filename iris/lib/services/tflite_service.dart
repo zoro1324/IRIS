@@ -18,11 +18,10 @@ class CameraPlane {
 /// Architecture (Mali-GPU-safe):
 ///  • Plain [Interpreter] on the main isolate — no IsolateInterpreter
 ///    (which crashes Mali GPUs by sharing native memory across isolates).
-///  • The detection_screen STOPS the camera image stream before calling
-///    detectObjects(), and RESTARTS it after. This ensures:
-///      1. No camera buffer contention during inference
-///      2. The GPU isn't rendering camera frames while TFLite runs
-///  • Frame rate is throttled via a Timer rather than frame counting.
+///  • The camera image stream stays running continuously; frames are
+///    throttled by the caller (detection_screen) via a timestamp guard.
+///  • Frame rate is controlled by skipping frames rather than stopping
+///    and restarting the camera pipeline, which avoids Mali GPU churn.
 class TfliteService {
   static final TfliteService _instance = TfliteService._internal();
   factory TfliteService() => _instance;
@@ -151,10 +150,6 @@ class TfliteService {
   // ─── Public API ──────────────────────────────────────────────────────────────
 
   /// Run detection on pre-copied plane data.
-  ///
-  /// IMPORTANT: The caller (detection_screen) must STOP the camera image
-  /// stream BEFORE calling this, and RESTART it AFTER this returns. This
-  /// prevents Mali GPU contention between the camera HAL and TFLite.
   Future<List<DetectionResult>> detectObjects(
     int imageWidth,
     int imageHeight,
